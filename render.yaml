@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: pcdl
+    runtime: docker
+    plan: free
+    region: singapore
+    healthCheckPath: /
+    envVars:
+      - key: ACCESS_KEY
+        generateValue: true
+      - key: RENDER_API_KEY
+        sync: false
+      - key: BANDWIDTH_LIMIT_MB
+        value: "4500"
