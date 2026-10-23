@@ -9,6 +9,7 @@ GET /item  → 單一項目（影片合併成 mp4）
 畫質：優先用 DASH 最高位元率；失敗時退回 HLS。
 只換容器、不重新編碼，速度快、畫質不損失。
 """
+import calendar
 import json
 import math
 import os
@@ -16,6 +17,8 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
@@ -25,7 +28,14 @@ from flask import Flask, Response, abort, request
 
 app = Flask(__name__)
 
-ACCESS_KEY = os.environ.get("ACCESS_KEY", "")
+# 可以設定多組金鑰，用逗號分開，例如「我的金鑰,朋友的金鑰」；刪掉某一組就能單獨停用
+ACCESS_KEYS = {k.strip() for k in os.environ.get("ACCESS_KEY", "").split(",") if k.strip()}
+
+
+def key_ok():
+    return bool(ACCESS_KEYS) and (request.args.get("key") or "").strip() in ACCESS_KEYS
+
+
 PAGE_HOSTS = set(os.environ.get("PAGE_HOSTS", "artist.mnetplus.world").split(","))
 MEDIA_PREFIX = os.environ.get("MEDIA_PREFIX", "https://media.static.bstage.in/")
 IMAGE_PREFIX = os.environ.get("IMAGE_PREFIX", "https://image.static.bstage.in/")
@@ -52,6 +62,90 @@ def write_concat(path, urls):
     with open(path, "wb") as f:
         for chunk in fetch_all(urls):
             f.write(chunk)
+
+
+# ---------- 流量煞車 ----------
+# 每次下載影片前查 Render 本月已用的對外流量，超過上限就拒絕，避免產生超額費用。
+RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")
+SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")      # Render 會自動提供
+LIMIT_MB = float(os.environ.get("BANDWIDTH_LIMIT_MB", "4500"))  # 額度 5 GB，留 0.5 GB 緩衝
+_UNIT_MB = {"b": 1 / 1e6, "bytes": 1 / 1e6, "kb": 1 / 1e3, "mb": 1, "gb": 1e3}
+_usage_cache = {"t": 0.0, "mb": None}
+
+
+def _sum_values(node, unit="mb"):
+    """Render 回傳的 JSON 裡把所有 value 加總，並依 unit 換算成 MB"""
+    total = 0.0
+    if isinstance(node, list):
+        for x in node:
+            total += _sum_values(x, unit)
+    elif isinstance(node, dict):
+        # 依來源拆開的資料只算 total，避免重複計算
+        src = (node.get("labels") or {}).get("trafficSource") if isinstance(node.get("labels"), dict) else None
+        if src and src != "total":
+            return 0.0
+        unit = str(node.get("unit", unit)).lower()
+        for k, v in node.items():
+            if k == "value" and isinstance(v, (int, float)):
+                total += v * _UNIT_MB.get(unit, 1)
+            elif isinstance(v, (list, dict)):
+                total += _sum_values(v, unit)
+    return total
+
+
+def month_usage_mb():
+    """本月（UTC）已用流量，單位 MB；查不到時回傳 None。結果快取 5 分鐘。"""
+    if not (RENDER_API_KEY and SERVICE_ID):
+        _usage_cache["errors"] = ["缺少 RENDER_SERVICE_ID 環境變數" if RENDER_API_KEY else "沒有設定 RENDER_API_KEY"]
+        return None
+    now = time.time()
+    if _usage_cache["mb"] is not None and now - _usage_cache["t"] < 300:
+        return _usage_cache["mb"]
+    t = time.gmtime(now)
+    start = int(calendar.timegm((t.tm_year, t.tm_mon, 1, 0, 0, 0)))
+    iso = lambda s: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(s))
+    # Render 文件對參數格式寫得不完整，依序嘗試幾種常見寫法，用第一個成功的
+    attempts = [
+        ("bandwidth", {"resource": SERVICE_ID, "startTime": start, "endTime": int(now)}),
+        ("bandwidth", {"resource": SERVICE_ID, "startTime": iso(start), "endTime": iso(now)}),
+        ("bandwidth", {"resource": SERVICE_ID, "startTime": start, "endTime": int(now),
+                       "resolutionSeconds": 3600}),
+        ("bandwidth-sources", {"resource": SERVICE_ID, "startTime": start, "endTime": int(now)}),
+    ]
+    errors = []
+    for path, params in attempts:
+        url = f"https://api.render.com/v1/metrics/{path}?" + urlencode(params)
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {RENDER_API_KEY}",
+                                                   "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                body = r.read()
+            mb = _sum_values(json.loads(body))
+        except urllib.error.HTTPError as e:
+            errors.append(f"{path} {e.code}: {e.read()[:200].decode('utf-8', 'replace')}")
+            if e.code in (401, 403):
+                break        # 金鑰本身有問題，換格式也沒用
+            continue
+        except Exception as e:
+            errors.append(f"{path}: {e!r}"[:250])
+            continue
+        _usage_cache.update(t=now, mb=mb, raw=body[:400].decode("utf-8", "replace"),
+                            via=f"{path} {list(params)}", errors=[])
+        return mb
+    _usage_cache.update(errors=errors)
+    return None
+
+
+def bandwidth_ok():
+    """沒設定 API 金鑰時不檢查；設定了但查詢失敗時，為了安全一律擋下"""
+    if not RENDER_API_KEY:
+        return True, None
+    mb = month_usage_mb()
+    if mb is None:
+        return False, "查不到本月流量，為避免超額先暫停影片下載"
+    if mb >= LIMIT_MB:
+        return False, f"本月流量已用 {mb / 1000:.2f} GB，達到上限，影片下載下個月恢復（照片仍可下載）"
+    return True, mb
 
 
 def ffmpeg(*args):
@@ -198,6 +292,7 @@ ALL_LABEL = "全部下載"
 @app.errorhandler(400)
 @app.errorhandler(403)
 @app.errorhandler(404)
+@app.errorhandler(429)
 @app.errorhandler(502)
 def plain_error(e):
     return Response(f"錯誤：{e.description}", status=e.code, mimetype="text/plain; charset=utf-8")
@@ -208,11 +303,27 @@ def health():
     return "ok"
 
 
+@app.get("/usage")
+def usage():
+    """查看本月流量（需要金鑰）"""
+    if not key_ok():
+        abort(403, "金鑰錯誤")
+    if not RENDER_API_KEY:
+        return text("尚未設定 RENDER_API_KEY，流量煞車沒有啟用")
+    _usage_cache["mb"] = None
+    mb = month_usage_mb()
+    if mb is None:
+        detail = "\n".join(_usage_cache.get("errors") or ["（沒有錯誤訊息）"])
+        return text(f"錯誤：查詢 Render 流量失敗\n服務 ID：{SERVICE_ID or '（空白）'}\n\n{detail}")
+    return text(f"本月已用 {mb:.1f} MB／上限 {LIMIT_MB:.0f} MB\n\n"
+                f"查詢方式：{_usage_cache.get('via')}\n原始回應開頭：{_usage_cache.get('raw')}")
+
+
 def load_post():
     """檢查金鑰與連結，回傳 (貼文連結, 媒體清單)"""
-    if not ACCESS_KEY or request.args.get("key") != ACCESS_KEY:
+    if not key_ok():
         abort(403, "金鑰錯誤")
-    # \u5f9e\u6574\u6bb5\u6587\u5b57\u88e1\u6293\u51fa\u7b2c\u4e00\u500b\u7db2\u5740\uff08\u8907\u88fd\u5230\u300c\u5206\u4eab\u6587\u5b57\uff0b\u9023\u7d50\u300d\u4e5f\u80fd\u7528\uff09
+    # 從整段文字裡抓出第一個網址（複製到「分享文字＋連結」也能用）
     raw = request.args.get("url") or ""
     found = re.search(r"https?://[^\s\"'\u201c\u201d<>]+", raw)
     link = found.group(0) if found else raw.strip()
@@ -235,7 +346,16 @@ def text(body, status=200):
 def list_items():
     """給捷徑的選單：每行一個選項；超過一個時第一行是「全部下載」"""
     _, items = load_post()
-    labels = [label(it, n) for n, it in enumerate(items, 1)]
+    has_video = any(it["type"] == "video" for it in items)
+    ok, msg = bandwidth_ok() if has_video else (True, None)
+    if not ok:
+        photos = [(n, it) for n, it in enumerate(items, 1) if it["type"] == "photo"]
+        if not photos:
+            abort(429, msg)
+        # 流量滿了：只列出照片（照片不經過伺服器、不吃流量）
+        labels = [label(it, n) for n, it in photos]
+    else:
+        labels = [label(it, n) for n, it in enumerate(items, 1)]
     return text("\n".join(([ALL_LABEL] if len(labels) > 1 else []) + labels))
 
 
@@ -248,8 +368,10 @@ def urls():
         idxs = list(range(1, len(items) + 1))
     else:
         idxs = sorted({int(n) for n in re.findall(r"\d+", pick) if 1 <= int(n) <= len(items)})
+    if any(items[i - 1]["type"] == "video" for i in idxs) and not bandwidth_ok()[0]:
+        idxs = [i for i in idxs if items[i - 1]["type"] == "photo"]
     if not idxs:
-        abort(400, "沒有選到任何項目")
+        abort(400, "沒有選到任何可下載的項目")
     base = request.host_url.rstrip("/")
     if request.headers.get("X-Forwarded-Proto") == "https":
         base = base.replace("http://", "https://", 1)
@@ -259,7 +381,7 @@ def urls():
         if it["type"] == "photo":
             out.append(it["url"])
         else:
-            out.append(f"{base}/item?{urlencode({'key': ACCESS_KEY, 'url': link, 'i': i})}")
+            out.append(f"{base}/item?{urlencode({'key': request.args.get('key', '').strip(), 'url': link, 'i': i})}")
     return text("\n".join(out))
 
 
@@ -275,6 +397,9 @@ def item():
         abort(404, f"這則貼文只有 {len(items)} 個項目")
     it = items[idx - 1]
     post_id = urlparse(link).path.rstrip("/").split("/")[-1][-8:]
+    ok, msg = bandwidth_ok()
+    if not ok:
+        abort(429, msg)
 
     if it["type"] == "photo":
         data = get(it["url"], binary=True)
