@@ -141,15 +141,16 @@ def has_cookies(domain):
     return any(c.domain.lstrip(".").endswith(domain) for c in _cookie_jar())
 
 
-def _opener():
-    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_cookie_jar()))
+def _opener(cookies=True):
+    jar = _cookie_jar() if cookies else http.cookiejar.CookieJar()
+    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
 
 
-def _fetch(url, ua=DESKTOP_UA, extra=None):
+def _fetch(url, ua=DESKTOP_UA, extra=None, cookies=True):
     """回傳 (最後網址, 內容文字)，會跟著轉址"""
     headers = {"User-Agent": ua, "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8"}
     headers.update(extra or {})
-    with _opener().open(urllib.request.Request(url, headers=headers), timeout=30) as r:
+    with _opener(cookies).open(urllib.request.Request(url, headers=headers), timeout=30) as r:
         return r.geturl(), r.read().decode("utf-8", "replace")
 
 
@@ -305,11 +306,31 @@ def _resolve_threads_share(link):
 def _threads(link):
     if "/share/" in link:
         link = _resolve_threads_share(link)
-    final, html = _fetch(link)
-    m = re.search(r"/post/([\w-]+)", final) or re.search(r"/post/([\w-]+)", link)
+    m = re.search(r"/post/([\w-]+)", link)
     if not m:
         raise SocialError("看不懂這個 Threads 連結，請用貼文的「複製連結」", 400)
     code = m.group(1)
+    # 先用沒登入的訪客身分開（Threads 通常會把貼文直接放在頁面裡），不行再帶 cookies
+    diags = []
+    for use_cookies in (False, True):
+        if use_cookies and not (has_cookies("threads.com") or has_cookies("threads.net")):
+            break
+        try:
+            final, html = _fetch(link, cookies=use_cookies)
+        except Exception as e:
+            diags.append(f"{'登入' if use_cookies else '訪客'}：開啟失敗 {e!r}"[:120])
+            continue
+        items, diag = _threads_parse(html, code, final)
+        if items is not None:
+            if not items:
+                raise SocialError("這則 Threads 貼文沒有照片或影片", 404)
+            return items
+        diags.append(("登入" if use_cookies else "訪客") + "：" + diag)
+    raise SocialError("在 Threads 頁面裡找不到這則貼文。\n（診斷：" + "\n".join(diags) + "）")
+
+
+def _threads_parse(html, code, final):
+    """回傳 (媒體清單或 None, 診斷文字)"""
     blobs = re.findall(r"<script[^>]*>\s*([\[{].*?)\s*</script>", html, re.S)
     with_code = parsed = 0
     for blob in blobs:
@@ -323,20 +344,13 @@ def _threads(link):
         parsed += 1
         for d in _walk(data):
             if d.get("code") == code and any(k in d for k in ("image_versions2", "carousel_media", "video_versions")):
-                items = _media_from_post(d)
-                if items:
-                    return items
-                raise SocialError("這則 Threads 貼文沒有照片或影片", 404)
-    if "login" in final or not has_cookies("threads.com") and not has_cookies("threads.net"):
-        raise SocialError("Threads 要登入才看得到，請在伺服器放小號的 cookies", 403)
+                return _media_from_post(d), ""
     title = re.search(r"<title[^>]*>(.*?)</title>", html, re.S)
     keys = [k for k in ("image_versions2", "carousel_media", "video_versions", "thread_items", "og:image")
             if k in html]
-    raise SocialError(
-        "在 Threads 頁面裡找不到這則貼文。\n"
-        f"（診斷：{final[:90]}｜標題 {(title.group(1).strip() if title else '無')[:40]}｜{len(html)} 字｜"
-        f"script {len(blobs)} 個，含貼文代碼 {with_code} 個，可解析 {parsed} 個｜"
-        f"代碼出現 {html.count(code)} 次｜關鍵字 {','.join(keys) or '無'}）")
+    return None, (f"{final[:70]}｜標題 {(title.group(1).strip() if title else '無')[:30]}｜{len(html)} 字｜"
+                  f"script {len(blobs)}，含代碼 {with_code}，可解析 {parsed}｜代碼出現 {html.count(code)} 次｜"
+                  f"關鍵字 {','.join(keys) or '無'}")
 
 
 # ---------- 抖音 ----------
