@@ -106,6 +106,13 @@ def _gdl_setup():
     if COOKIES:
         config.set(("extractor",), "cookies", COOKIES)
     config.set(("extractor",), "cookies-update", False)
+    # 預設遇到限流會等很久（IG 每個請求間隔 6–12 秒、429 時每次等 60 秒重試 4 次），
+    # 捷徑和瀏覽器會一直轉圈。改成快速失敗，直接回錯誤訊息。
+    config.set(("extractor",), "retries", 1)
+    config.set(("extractor",), "timeout", 20)
+    config.set(("extractor",), "sleep-request", 0)
+    config.set(("extractor",), "sleep-429", 3)
+    config.set(("extractor", "instagram"), "sleep-request", 0.5)
     config.set(("extractor", "instagram"), "videos", "merged")  # 單一 mp4（含聲音），手機能直接抓
     config.set(("extractor", "tiktok"), "videos", "ytdl")       # TikTok 影片交給 yt-dlp
     config.set(("extractor", "tiktok"), "audio", False)
