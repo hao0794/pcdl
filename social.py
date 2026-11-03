@@ -20,8 +20,9 @@ import re
 import shutil
 import threading
 import time
+import urllib.error
 import urllib.request
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 DESKTOP_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -273,42 +274,53 @@ def _media_from_post(post):
     return out
 
 
+_POST_RE = re.compile(r"(?:https?://(?:www\.)?threads\.(?:com|net))?\\?/@([\w.]+)\\?/post\\?/([\w-]+)")
+
+
+def _post_url_in(final, html):
+    """從最後網址（包含 login?next=… 裡的網址）或頁面內容找出真正的貼文網址"""
+    for src in (unquote(unquote(final)), html.replace("\\/", "/")):
+        mm = _POST_RE.search(src)
+        if mm:
+            return f"https://www.threads.com/@{mm.group(1)}/post/{mm.group(2)}"
+    return None
+
+
+def _resolve_threads_share(link):
+    """分享短網址（/share/xxx）→ 真正的貼文網址"""
+    try:
+        final, html = _fetch(link)
+    except urllib.error.HTTPError as e:
+        final = e.headers.get("Location") or e.geturl() or link
+        html = e.read().decode("utf-8", "replace") if e.fp else ""
+    if (real := _post_url_in(final, html)):
+        return real
+    title = re.search(r"<title[^>]*>(.*?)</title>", html, re.S)
+    raise SocialError(
+        "Threads 分享短網址解不開。請在 Safari 打開這個連結，等它跳到貼文後，"
+        "複製網址列裡 threads.com/@帳號/post/… 的完整網址再試一次。\n"
+        f"（伺服器看到：{final[:100]}｜{(title.group(1).strip() if title else '無標題')[:40]}｜{len(html)} 字）", 400)
+
+
 def _threads(link):
+    if "/share/" in link:
+        link = _resolve_threads_share(link)
     final, html = _fetch(link)
-    m = re.search(r"/post/([\w-]+)", final) or re.search(r"/(?:t|p)/([\w-]+)", final)
+    m = re.search(r"/post/([\w-]+)", final) or re.search(r"/post/([\w-]+)", link)
     if not m:
-        # 分享短網址（/share/xxx）不是用 HTTP 轉址，真正的網址藏在頁面裡
-        real = None
-        for pat in (r'<link[^>]+rel="canonical"[^>]+href="([^"]+)"',
-                    r'<meta[^>]+property="og:url"[^>]+content="([^"]+)"',
-                    r'(https://www\.threads\.(?:com|net)/@[\w.]+/post/[\w-]+)',
-                    r'(?:href|url|content)=["\'](?:https://www\.threads\.(?:com|net))?(/@[\w.]+/post/[\w-]+)'):
-            mm = re.search(pat, html)
-            if mm and "/post/" in mm.group(1):
-                real = mm.group(1).replace("\\/", "/")
-                break
-        if real is None:
-            # 有些頁面把網址寫在 JSON 裡（斜線被跳脫）
-            mm = re.search(r'\\?/@([\w.]+)\\?/post\\?/([\w-]+)', html)
-            if mm:
-                real = f"/@{mm.group(1)}/post/{mm.group(2)}"
-        if real:
-            if real.startswith("/"):
-                real = "https://www.threads.com" + real
-            final, html = _fetch(real)
-            m = re.search(r"/post/([\w-]+)", final) or re.search(r"/post/([\w-]+)", real)
-    if not m:
-        if "/share/" in link and ("login" in final or "/share/" in final):
-            raise SocialError("Threads 分享短網址解不開，請改用貼文右上角 ⋯ → 複製連結", 400)
         raise SocialError("看不懂這個 Threads 連結，請用貼文的「複製連結」", 400)
     code = m.group(1)
-    for blob in re.findall(r'<script type="application/json"[^>]*>(.*?)</script>', html, re.S):
+    blobs = re.findall(r"<script[^>]*>\s*([\[{].*?)\s*</script>", html, re.S)
+    with_code = parsed = 0
+    for blob in blobs:
         if code not in blob:
             continue
+        with_code += 1
         try:
             data = json.loads(blob)
         except ValueError:
             continue
+        parsed += 1
         for d in _walk(data):
             if d.get("code") == code and any(k in d for k in ("image_versions2", "carousel_media", "video_versions")):
                 items = _media_from_post(d)
@@ -317,7 +329,14 @@ def _threads(link):
                 raise SocialError("這則 Threads 貼文沒有照片或影片", 404)
     if "login" in final or not has_cookies("threads.com") and not has_cookies("threads.net"):
         raise SocialError("Threads 要登入才看得到，請在伺服器放小號的 cookies", 403)
-    raise SocialError("在 Threads 頁面裡找不到這則貼文（cookies 可能過期了）")
+    title = re.search(r"<title[^>]*>(.*?)</title>", html, re.S)
+    keys = [k for k in ("image_versions2", "carousel_media", "video_versions", "thread_items", "og:image")
+            if k in html]
+    raise SocialError(
+        "在 Threads 頁面裡找不到這則貼文。\n"
+        f"（診斷：{final[:90]}｜標題 {(title.group(1).strip() if title else '無')[:40]}｜{len(html)} 字｜"
+        f"script {len(blobs)} 個，含貼文代碼 {with_code} 個，可解析 {parsed} 個｜"
+        f"代碼出現 {html.count(code)} 次｜關鍵字 {','.join(keys) or '無'}）")
 
 
 # ---------- 抖音 ----------
