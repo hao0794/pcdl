@@ -512,6 +512,13 @@ def extract(link):
         raise SocialError("不支援這個網站", 400)
     if not items:
         raise SocialError("這則貼文裡沒有照片或影片", 404)
+    if plat == "instagram":
+        # IG 的網址帶簽名，經過捷徑時會被重新編碼而失效（Bad URL hash），
+        # 改由伺服器原封不動地下載再轉給手機
+        for it in items:
+            if it.get("server") is None:
+                it["server"] = "http"
+                it["headers"] = {"User-Agent": DESKTOP_UA, "Referer": "https://www.instagram.com/"}
     for k in [k for k, v in _cache.items() if time.time() - v[0] >= CACHE_SEC]:
         _cache.pop(k, None)
     _cache[link] = (time.time(), items)
