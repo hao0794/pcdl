@@ -326,7 +326,68 @@ def _threads(link):
                 raise SocialError("這則 Threads 貼文沒有照片或影片", 404)
             return items
         diags.append(("登入" if use_cookies else "訪客") + "：" + diag)
+    # 備援：官方的嵌入頁（給其他網站嵌入貼文用），媒體直接寫在 HTML 裡
+    embed = re.sub(r"[?#].*$", "", link).rstrip("/") + "/embed/"
+    try:
+        final, html = _fetch(embed, cookies=False)
+        items, diag = _threads_embed_parse(html)
+        if items:
+            return items
+        diags.append("嵌入頁：" + diag)
+    except Exception as e:
+        diags.append(f"嵌入頁：開啟失敗 {e!r}"[:120])
     raise SocialError("在 Threads 頁面裡找不到這則貼文。\n（診斷：" + "\n".join(diags) + "）")
+
+
+def _largest_from_srcset(srcset):
+    best, best_w = None, -1
+    for part in srcset.split(","):
+        bits = part.strip().split()
+        if not bits:
+            continue
+        w = int(re.sub(r"\D", "", bits[1]) or 0) if len(bits) > 1 else 0
+        if w > best_w:
+            best, best_w = bits[0], w
+    return best
+
+
+def _threads_embed_parse(html):
+    """嵌入頁 → 媒體清單（依出現順序）。排除大頭貼（網址含 t51.2885-19 / t51.82787-19）"""
+    from html import unescape
+    items, seen = [], set()
+
+    def add(kind, url):
+        url = unescape(url or "").strip()
+        key = re.sub(r"\?.*$", "", url)
+        if not url.startswith("http") or key in seen:
+            return
+        if kind == "photo" and re.search(r"t51\.\d+-19/|/s150x150/|profile_pic", url):
+            return
+        seen.add(key)
+        items.append({"type": kind, "url": url, "server": None})
+
+    # 依照在頁面裡的位置排序：影片與照片混在一起時順序才會對
+    found = []
+    for m in re.finditer(r"<video\b[^>]*>(.*?)</video>|<video\b[^>]*/?>", html, re.S | re.I):
+        tag = m.group(0)
+        src = re.search(r'\ssrc="([^"]+)"', tag) or re.search(r'<source[^>]+src="([^"]+)"', tag)
+        if src:
+            found.append((m.start(), "video", src.group(1)))
+    video_spans = [(m.start(), m.end()) for m in re.finditer(r"<video\b.*?(?:</video>|/>)", html, re.S | re.I)]
+    for m in re.finditer(r"<img\b[^>]*>", html, re.I):
+        if any(a <= m.start() < b for a, b in video_spans):   # 影片的封面圖不算
+            continue
+        tag = m.group(0)
+        srcset = re.search(r'srcset="([^"]+)"', tag)
+        src = re.search(r'\ssrc="([^"]+)"', tag)
+        url = _largest_from_srcset(unescape(srcset.group(1))) if srcset else (src.group(1) if src else None)
+        if url and re.search(r"//scontent[\w.-]*\.(cdninstagram\.com|fbcdn\.net)/", url):
+            found.append((m.start(), "photo", url))
+    for _, kind, url in sorted(found):
+        add(kind, url)
+    title = re.search(r"<title[^>]*>(.*?)</title>", html, re.S)
+    return items, (f"標題 {(title.group(1).strip() if title else '無')[:30]}｜{len(html)} 字｜"
+                   f"img {len(re.findall(r'<img', html, re.I))}，video {len(re.findall(r'<video', html, re.I))}")
 
 
 def _threads_parse(html, code, final):
