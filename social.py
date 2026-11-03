@@ -277,6 +277,29 @@ def _threads(link):
     final, html = _fetch(link)
     m = re.search(r"/post/([\w-]+)", final) or re.search(r"/(?:t|p)/([\w-]+)", final)
     if not m:
+        # 分享短網址（/share/xxx）不是用 HTTP 轉址，真正的網址藏在頁面裡
+        real = None
+        for pat in (r'<link[^>]+rel="canonical"[^>]+href="([^"]+)"',
+                    r'<meta[^>]+property="og:url"[^>]+content="([^"]+)"',
+                    r'(https://www\.threads\.(?:com|net)/@[\w.]+/post/[\w-]+)',
+                    r'(?:href|url|content)=["\'](?:https://www\.threads\.(?:com|net))?(/@[\w.]+/post/[\w-]+)'):
+            mm = re.search(pat, html)
+            if mm and "/post/" in mm.group(1):
+                real = mm.group(1).replace("\\/", "/")
+                break
+        if real is None:
+            # 有些頁面把網址寫在 JSON 裡（斜線被跳脫）
+            mm = re.search(r'\\?/@([\w.]+)\\?/post\\?/([\w-]+)', html)
+            if mm:
+                real = f"/@{mm.group(1)}/post/{mm.group(2)}"
+        if real:
+            if real.startswith("/"):
+                real = "https://www.threads.com" + real
+            final, html = _fetch(real)
+            m = re.search(r"/post/([\w-]+)", final) or re.search(r"/post/([\w-]+)", real)
+    if not m:
+        if "/share/" in link and ("login" in final or "/share/" in final):
+            raise SocialError("Threads 分享短網址解不開，請改用貼文右上角 ⋯ → 複製連結", 400)
         raise SocialError("看不懂這個 Threads 連結，請用貼文的「複製連結」", 400)
     code = m.group(1)
     for blob in re.findall(r'<script type="application/json"[^>]*>(.*?)</script>', html, re.S):
