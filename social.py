@@ -148,7 +148,15 @@ def _opener(cookies=True):
 
 def _fetch(url, ua=DESKTOP_UA, extra=None, cookies=True):
     """回傳 (最後網址, 內容文字)，會跟著轉址"""
-    headers = {"User-Agent": ua, "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8"}
+    # 一般瀏覽器開網頁時都會送的標頭；少了這些，部分網站只會回空殼頁面
+    headers = {"User-Agent": ua,
+               "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+               "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+               "Upgrade-Insecure-Requests": "1",
+               "Sec-Fetch-Dest": "document",
+               "Sec-Fetch-Mode": "navigate",
+               "Sec-Fetch-Site": "none",
+               "Sec-Fetch-User": "?1"}
     headers.update(extra or {})
     with _opener(cookies).open(urllib.request.Request(url, headers=headers), timeout=30) as r:
         return r.geturl(), r.read().decode("utf-8", "replace")
@@ -407,8 +415,12 @@ def _threads_parse(html, code, final):
             if d.get("code") == code and any(k in d for k in ("image_versions2", "carousel_media", "video_versions")):
                 return _media_from_post(d), ""
     title = re.search(r"<title[^>]*>(.*?)</title>", html, re.S)
-    keys = [k for k in ("image_versions2", "carousel_media", "video_versions", "thread_items", "og:image")
+    keys = [k for k in ("image_versions2", "carousel_media", "video_versions", "thread_items", "og:image",
+                        "BarcelonaPostPage", "LSD", "login", "checkpoint", "challenge", "unsupported")
             if k in html]
+    user = re.search(r"/@([\w.]+)/post/", final)
+    if user and user.group(1) in html:
+        keys.append("帳號名")
     return None, (f"{final[:70]}｜標題 {(title.group(1).strip() if title else '無')[:30]}｜{len(html)} 字｜"
                   f"script {len(blobs)}，含代碼 {with_code}，可解析 {parsed}｜代碼出現 {html.count(code)} 次｜"
                   f"關鍵字 {','.join(keys) or '無'}")
