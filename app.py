@@ -1,10 +1,11 @@
 """
-Plus Chat 影片下載伺服器（個人用）
+Plus Chat／IG／Threads／X／TikTok／抖音 下載伺服器（個人用）
 
 GET /list  → 選單文字（全部下載／影片1／照片2…）
 GET /urls  → 選到的項目轉成下載網址
 GET /item  → 單一項目（影片合併成 mp4）
-  每個請求都要帶 key=<金鑰>&url=<Plus Chat 貼文連結>
+  每個請求都要帶 key=<金鑰>&url=<貼文連結>
+  Plus Chat 以外的平台在 social.py
 
 畫質：優先用 DASH 最高位元率；失敗時退回 HLS。
 只換容器、不重新編碼，速度快、畫質不損失。
@@ -25,6 +26,8 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlencode, urljoin, urlparse
 
 from flask import Flask, Response, abort, request
+
+import social
 
 app = Flask(__name__)
 
@@ -195,6 +198,13 @@ def parse_post(page_html):
     return False, items
 
 
+def via_server(item):
+    """這個項目要不要經過伺服器（會吃流量）。Plus Chat 影片一定要；社群平台看情況"""
+    if "server" in item:
+        return item["server"] is not None
+    return item["type"] == "video"
+
+
 def label(item, n):
     return ("影片" if item["type"] == "video" else "照片") + str(n)
 
@@ -328,8 +338,17 @@ def load_post():
     found = re.search(r"https?://[^\s\"'\u201c\u201d<>]+", raw)
     link = found.group(0) if found else raw.strip()
     parsed = urlparse(link)
-    if parsed.scheme not in ("https", "http") or parsed.hostname not in PAGE_HOSTS:
-        abort(400, "請提供 Plus Chat 貼文連結")
+    if parsed.scheme not in ("https", "http"):
+        abort(400, "請提供貼文連結")
+    if parsed.hostname not in PAGE_HOSTS:
+        if not social.platform_of(link):
+            abort(400, "目前支援 Plus Chat、IG、Threads、X、TikTok、抖音的貼文連結")
+        try:
+            return link, social.extract(link)
+        except social.SocialError as e:
+            abort(e.code, str(e))
+        except Exception as e:
+            abort(502, f"解析失敗：{e}"[:300])
     paid, items = parse_post(get(link))
     if paid and not items:
         abort(403, "這是付費會員貼文，只支援公開貼文")
@@ -346,14 +365,14 @@ def text(body, status=200):
 def list_items():
     """給捷徑的選單：每行一個選項；超過一個時第一行是「全部下載」"""
     _, items = load_post()
-    has_video = any(it["type"] == "video" for it in items)
-    ok, msg = bandwidth_ok() if has_video else (True, None)
+    heavy = any(via_server(it) for it in items)
+    ok, msg = bandwidth_ok() if heavy else (True, None)
     if not ok:
-        photos = [(n, it) for n, it in enumerate(items, 1) if it["type"] == "photo"]
-        if not photos:
+        light = [(n, it) for n, it in enumerate(items, 1) if not via_server(it)]
+        if not light:
             abort(429, msg)
-        # 流量滿了：只列出照片（照片不經過伺服器、不吃流量）
-        labels = [label(it, n) for n, it in photos]
+        # 流量滿了：只列出不經過伺服器、不吃流量的項目
+        labels = [label(it, n) for n, it in light]
     else:
         labels = [label(it, n) for n, it in enumerate(items, 1)]
     return text("\n".join(([ALL_LABEL] if len(labels) > 1 else []) + labels))
@@ -368,8 +387,8 @@ def urls():
         idxs = list(range(1, len(items) + 1))
     else:
         idxs = sorted({int(n) for n in re.findall(r"\d+", pick) if 1 <= int(n) <= len(items)})
-    if any(items[i - 1]["type"] == "video" for i in idxs) and not bandwidth_ok()[0]:
-        idxs = [i for i in idxs if items[i - 1]["type"] == "photo"]
+    if any(via_server(items[i - 1]) for i in idxs) and not bandwidth_ok()[0]:
+        idxs = [i for i in idxs if not via_server(items[i - 1])]
     if not idxs:
         abort(400, "沒有選到任何可下載的項目")
     base = request.host_url.rstrip("/")
@@ -378,11 +397,42 @@ def urls():
     out = []
     for i in idxs:
         it = items[i - 1]
-        if it["type"] == "photo":
+        if not via_server(it):
             out.append(it["url"])
         else:
             out.append(f"{base}/item?{urlencode({'key': request.args.get('key', '').strip(), 'url': link, 'i': i})}")
     return text("\n".join(out))
+
+
+def stream_file(path, work, name, mimetype):
+    size = os.path.getsize(path)
+
+    def gen():
+        try:
+            with open(path, "rb") as f:
+                while chunk := f.read(1 << 16):
+                    yield chunk
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    return Response(gen(), mimetype=mimetype, headers={
+        "Content-Length": str(size),
+        "Content-Disposition": f'attachment; filename="{name}"',
+    })
+
+
+def social_item(it, post_id, idx, plat):
+    work = tempfile.mkdtemp()
+    try:
+        path = social.download(it, work)
+    except Exception as e:
+        shutil.rmtree(work, ignore_errors=True)
+        abort(502, f"下載失敗：{e}"[:300])
+    ext = os.path.splitext(path)[1].lstrip(".").lower() or "bin"
+    mimetype = {"mp4": "video/mp4", "mov": "video/quicktime", "webm": "video/webm",
+                "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                "webp": "image/webp"}.get(ext, "application/octet-stream")
+    return stream_file(path, work, f"{plat}_{post_id}_{idx}.{ext}", mimetype)
 
 
 @app.get("/item")
@@ -396,10 +446,13 @@ def item():
     if not 1 <= idx <= len(items):
         abort(404, f"這則貼文只有 {len(items)} 個項目")
     it = items[idx - 1]
-    post_id = urlparse(link).path.rstrip("/").split("/")[-1][-8:]
+    post_id = re.sub(r"[^\w-]", "", urlparse(link).path.rstrip("/").split("/")[-1])[-12:] or "post"
     ok, msg = bandwidth_ok()
     if not ok:
         abort(429, msg)
+
+    if "server" in it:          # 社群平台
+        return social_item(it, post_id, idx, social.platform_of(link))
 
     if it["type"] == "photo":
         data = get(it["url"], binary=True)

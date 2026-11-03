@@ -1,2 +1,4 @@
 flask==3.1.*
 gunicorn==23.*
+yt-dlp
+gallery-dl
