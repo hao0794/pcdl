@@ -512,10 +512,13 @@ def extract(link):
         raise SocialError("不支援這個網站", 400)
     if not items:
         raise SocialError("這則貼文裡沒有照片或影片", 404)
-    if plat == "instagram":
-        # IG 的網址帶簽名，經過捷徑時會被重新編碼而失效（Bad URL hash），
-        # 改由伺服器原封不動地下載再轉給手機
+    if plat in ("instagram", "threads"):
+        # IG／Threads 的網址帶簽名，部分網址經過捷徑時會被重新編碼而失效（Bad URL hash），
+        # 改由伺服器原封不動地下載再轉給手機。Threads 影片目前直接下載沒問題，
+        # 為了省流量先維持直連；IG 影片一律轉傳。
         for it in items:
+            if plat == "threads" and it["type"] == "video":
+                continue
             if it.get("server") is None:
                 it["server"] = "http"
                 it["headers"] = {"User-Agent": DESKTOP_UA, "Referer": "https://www.instagram.com/"}
