@@ -31,6 +31,32 @@ import social
 
 app = Flask(__name__)
 
+
+# ---------- 保持清醒 ----------
+# Render 免費方案 15 分鐘沒有連線就會休眠，偶爾還會卡在叫不醒的狀態。
+# 這裡每 10 分鐘連一次自己的公開網址，讓伺服器一直醒著。
+# 一個月約 744 小時，在免費的 750 小時內；設 KEEP_ALIVE=0 可以關掉。
+def _keep_alive():
+    import threading
+    url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not url or os.environ.get("KEEP_ALIVE", "1") == "0":
+        print("keep-alive 未啟用", flush=True)
+        return
+    print(f"keep-alive 啟用：每 10 分鐘連一次 {url}/", flush=True)
+
+    def loop():
+        while True:
+            time.sleep(600)
+            try:
+                urllib.request.urlopen(url + "/", timeout=30).read()
+            except Exception as e:
+                print(f"keep-alive 失敗：{e!r}", flush=True)
+
+    threading.Thread(target=loop, name="keep-alive", daemon=True).start()
+
+
+_keep_alive()
+
 # 可以設定多組金鑰，用逗號分開，例如「我的金鑰,朋友的金鑰」；刪掉某一組就能單獨停用
 ACCESS_KEYS = {k.strip() for k in os.environ.get("ACCESS_KEY", "").split(",") if k.strip()}
 
